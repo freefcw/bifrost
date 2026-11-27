@@ -8,8 +8,10 @@
 package circuitbreaker
 
 import (
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
@@ -69,6 +71,7 @@ type flight struct {
 type circuit struct {
 	fails      int
 	openUntil  time.Time
+	changedAt  time.Time // when the last counted failure was recorded
 	probing    bool
 	probeStart time.Time
 	last       snap
@@ -77,6 +80,7 @@ type circuit struct {
 
 type admission struct {
 	id            string
+	at            time.Time
 	provider      schemas.ModelProvider
 	model         string
 	providerProbe bool
@@ -100,11 +104,12 @@ type Plugin struct {
 	// mu guards circuits. The map is process state reused across requests;
 	// a live-store table cannot host this read-modify-write (concurrent
 	// admits must not lose a failure count). Entries exist only for upstreams
-	// that are in flight or unhealthy, and a healthy provider or key entry is
-	// removed when it recovers. Model entries stay, one per provider+model
-	// that has been called, to hold the in-flight list without reallocating.
+	// that are in flight or unhealthy. A provider, model or key entry is removed
+	// once it is healthy and has nothing in flight, so one-off model names do
+	// not stay in the map.
 	mu       sync.Mutex
 	circuits map[circuitID]*circuit
+	seq      atomic.Uint64
 }
 
 // Init builds a breaker. A nil config uses the defaults. A nil logger discards
@@ -152,10 +157,9 @@ func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostReq
 		ctx.ClearValue(schemas.BifrostContextKeyCircuitSkipKeyIDs)
 		return req, nil, nil
 	}
-	pinned, _ := ctx.Value(schemas.BifrostContextKeyAPIKeyID).(string)
-	pinned = strings.TrimSpace(pinned)
+	pinned := p.pinnedKeyID(ctx, provider)
 
-	skip, block, adm := p.admit(provider, model, attemptID(ctx), pinned)
+	skip, block, adm := p.admit(provider, model, p.nextFlight(), pinned)
 	if block != nil {
 		ctx.SetValue(replayKey{}, true)
 		ctx.ClearValue(schemas.BifrostContextKeyCircuitSkipKeyIDs)
@@ -195,6 +199,9 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	}
 	ctx.SetValue(settledKey{}, true)
 	p.settle(ctx, adm, bifrostErr)
+	if replay := p.replayIfKeysSkipped(adm, bifrostErr); replay != nil {
+		return resp, replay, nil
+	}
 	return resp, bifrostErr, nil
 }
 
@@ -211,14 +218,29 @@ func terminal(ctx *schemas.BifrostContext, err *schemas.BifrostError) bool {
 	return !streaming
 }
 
-func attemptID(ctx *schemas.BifrostContext) string {
-	if fb, _ := ctx.Value(schemas.BifrostContextKeyFallbackRequestID).(string); fb != "" {
-		return fb
+func (p *Plugin) nextFlight() string {
+	return strconv.FormatUint(p.seq.Add(1), 10)
+}
+
+// pinnedKeyID is the key the caller named for this attempt, by id or by name.
+// A name is resolved through the key list the HTTP gateway passes in. Core
+// returns a name pin before it applies the skip list, so the pin has to be
+// turned into an id here.
+func (p *Plugin) pinnedKeyID(ctx *schemas.BifrostContext, provider schemas.ModelProvider) string {
+	if id, _ := ctx.Value(schemas.BifrostContextKeyAPIKeyID).(string); strings.TrimSpace(id) != "" {
+		return strings.TrimSpace(id)
 	}
-	if id, _ := ctx.Value(schemas.BifrostContextKeyRequestID).(string); id != "" {
-		return id
+	name, _ := ctx.Value(schemas.BifrostContextKeyAPIKeyName).(string)
+	name = strings.TrimSpace(name)
+	if name == "" || p.keys == nil {
+		return ""
 	}
-	return "attempt"
+	for _, key := range p.keys(provider) {
+		if key.Name == name && key.ID != "" {
+			return key.ID
+		}
+	}
+	return ""
 }
 
 // admit decides whether this attempt may call the upstream. skip is the set of
@@ -229,7 +251,7 @@ func (p *Plugin) admit(provider schemas.ModelProvider, model, id, pinned string)
 	defer p.mu.Unlock()
 	now := p.now()
 	p.sweep(now)
-	adm := admission{id: id, provider: provider, model: model}
+	adm := admission{id: id, at: now, provider: provider, model: model}
 
 	provID := circuitID{scope: scopeProvider, provider: provider}
 	prov := p.circuits[provID]
@@ -359,28 +381,36 @@ func (p *Plugin) settle(ctx *schemas.BifrostContext, adm admission, err *schemas
 	defer p.mu.Unlock()
 	now := p.now()
 	modID := circuitID{scope: scopeModel, provider: adm.provider, model: adm.model}
+	sawByte := false
 	if mod := p.circuits[modID]; mod != nil {
+		sawByte = mod.saw(adm.id)
 		mod.drop(adm.id)
 	}
 
 	if err == nil {
 		p.recordTrail(ctx, adm, now)
-		p.noteSuccess(adm.provider, adm.model, selectedKeyID(ctx))
+		p.noteSuccess(adm, selectedKeyID(ctx))
 		return
 	}
+	cancelled := bifrost.ClassifyFailure(err) == schemas.FailureClassCancelled
 	if trail, _ := ctx.Value(schemas.BifrostContextKeyAttemptTrail).([]schemas.KeyAttemptRecord); len(trail) > 0 {
 		for i := range trail {
 			e := err
-			if i != len(trail)-1 {
+			// A cancel during backoff never dispatched another attempt. The last
+			// trail record is the upstream failure that already happened; the
+			// request-level cancel must not hide it.
+			if i != len(trail)-1 || (cancelled && trail[i].FailureClass != "") {
 				e = errFromRecord(&trail[i])
 			}
 			probe := adm.providerProbe && i == len(trail)-1
 			modelProbe := adm.modelProbe && i == len(trail)-1
-			p.observe(adm.provider, adm.model, trail[i].KeyID, e, probe, modelProbe, now)
+			p.observe(adm.provider, adm.model, trail[i].KeyID, e, probe, modelProbe, sawByte, now)
 		}
+		p.dropIdle(adm.provider, adm.model)
 		return
 	}
-	p.observe(adm.provider, adm.model, selectedKeyID(ctx), err, adm.providerProbe, adm.modelProbe, now)
+	p.observe(adm.provider, adm.model, selectedKeyID(ctx), err, adm.providerProbe, adm.modelProbe, sawByte, now)
+	p.dropIdle(adm.provider, adm.model)
 }
 
 // recordTrail counts failures of keys rotated away from before a later
@@ -391,37 +421,37 @@ func (p *Plugin) recordTrail(ctx *schemas.BifrostContext, adm admission, now tim
 		if trail[i].FailureClass == "" {
 			continue
 		}
-		p.observe(adm.provider, adm.model, trail[i].KeyID, errFromRecord(&trail[i]), false, false, now)
+		p.observe(adm.provider, adm.model, trail[i].KeyID, errFromRecord(&trail[i]), false, false, false, now)
 	}
 }
 
-func (p *Plugin) noteSuccess(provider schemas.ModelProvider, model, keyID string) {
-	if c := p.circuits[circuitID{scope: scopeProvider, provider: provider}]; c != nil {
-		if c.fails > 0 || !c.openUntil.IsZero() {
-			p.log.Info("[circuitbreaker] closed %s", circuitID{scope: scopeProvider, provider: provider})
-		}
-		c.succeed()
-		delete(p.circuits, circuitID{scope: scopeProvider, provider: provider})
+func (p *Plugin) noteSuccess(adm admission, keyID string) {
+	p.finish(circuitID{scope: scopeProvider, provider: adm.provider}, adm.at)
+	p.finish(circuitID{scope: scopeModel, provider: adm.provider, model: adm.model}, adm.at)
+	if keyID != "" {
+		p.finish(circuitID{scope: scopeKey, provider: adm.provider, model: adm.model, keyID: keyID}, adm.at)
 	}
-	if c := p.circuits[circuitID{scope: scopeModel, provider: provider, model: model}]; c != nil {
-		if c.fails > 0 || !c.openUntil.IsZero() {
-			p.log.Info("[circuitbreaker] closed %s", circuitID{scope: scopeModel, provider: provider, model: model})
-		}
-		c.succeed()
-	}
-	if keyID == "" {
+	p.dropIdle(adm.provider, adm.model)
+}
+
+// finish clears a circuit whose last failure is not newer than this attempt.
+// A success that was admitted before a later failure opened the circuit leaves
+// that newer state in place.
+func (p *Plugin) finish(id circuitID, admittedAt time.Time) {
+	c := p.circuits[id]
+	if c == nil || c.changedAt.After(admittedAt) {
 		return
 	}
-	id := circuitID{scope: scopeKey, provider: provider, model: model, keyID: keyID}
-	if c := p.circuits[id]; c != nil {
-		if c.fails > 0 || !c.openUntil.IsZero() {
-			p.log.Info("[circuitbreaker] closed %s", id)
-		}
+	if c.fails > 0 || !c.openUntil.IsZero() {
+		p.log.Info("[circuitbreaker] closed %s", id)
+	}
+	c.succeed()
+	if id.scope != scopeModel || c.idle() {
 		delete(p.circuits, id)
 	}
 }
 
-func (p *Plugin) observe(provider schemas.ModelProvider, model, keyID string, err *schemas.BifrostError, providerProbe, modelProbe bool, now time.Time) {
+func (p *Plugin) observe(provider schemas.ModelProvider, model, keyID string, err *schemas.BifrostError, providerProbe, modelProbe, sawByte bool, now time.Time) {
 	if err == nil {
 		return
 	}
@@ -431,8 +461,18 @@ func (p *Plugin) observe(provider schemas.ModelProvider, model, keyID string, er
 		return
 	}
 	conn := isConnection(err)
+	// A stream that already produced a byte and then lost the connection is
+	// not the host being unreachable. Bedrock reports that drop with the same
+	// message as a failure to connect.
+	if conn && sawByte {
+		conn = false
+	}
 	timeout := class == schemas.FailureClassTimeout
 	s := snapOf(err)
+	status := 0
+	if err.StatusCode != nil {
+		status = *err.StatusCode
+	}
 
 	provID := circuitID{scope: scopeProvider, provider: provider}
 	switch {
@@ -458,7 +498,9 @@ func (p *Plugin) observe(provider schemas.ModelProvider, model, keyID string, er
 	switch {
 	case conn || class == schemas.FailureClassCancelled:
 		return
-	case timeout || class == schemas.FailureClassTransient:
+	case timeout || class == schemas.FailureClassTransient || (class == schemas.FailureClassRateLimit && status >= 500):
+		// A 5xx whose body mentions a rate limit is still the model endpoint
+		// failing. Only an HTTP 429 is scoped to the key.
 		c := p.must(circuitID{scope: scopeModel, provider: provider, model: model})
 		if c.fail(now, p.cfg, modelProbe, s) {
 			why := "upstream"
@@ -467,7 +509,7 @@ func (p *Plugin) observe(provider schemas.ModelProvider, model, keyID string, er
 			}
 			p.log.Info("[circuitbreaker] open %s after %d %s failures until %s", circuitID{scope: scopeModel, provider: provider, model: model}, c.fails, why, c.openUntil.Format(time.RFC3339))
 		}
-	case class == schemas.FailureClassRateLimit && p.cfg.countRateLimit && keyID != "":
+	case class == schemas.FailureClassRateLimit && p.cfg.countRateLimit && keyID != "" && status == 429:
 		id := circuitID{scope: scopeKey, provider: provider, model: model, keyID: keyID}
 		c := p.must(id)
 		if c.fail(now, p.cfg, false, s) {
@@ -501,17 +543,45 @@ func (p *Plugin) add(id circuitID) *circuit {
 
 func (p *Plugin) sweep(now time.Time) {
 	for id, c := range p.circuits {
-		if id.scope != scopeModel || len(c.pending) == 0 {
+		if id.scope != scopeModel {
 			continue
 		}
-		kept := c.pending[:0]
-		for _, f := range c.pending {
-			if now.Sub(f.start) < abandonAfter {
-				kept = append(kept, f)
+		if len(c.pending) > 0 {
+			kept := c.pending[:0]
+			for _, f := range c.pending {
+				if now.Sub(f.start) < abandonAfter {
+					kept = append(kept, f)
+				}
 			}
+			c.pending = kept
 		}
-		c.pending = kept
+		if c.idle() {
+			delete(p.circuits, id)
+		}
 	}
+}
+
+func (p *Plugin) dropIdle(provider schemas.ModelProvider, model string) {
+	id := circuitID{scope: scopeModel, provider: provider, model: model}
+	if c := p.circuits[id]; c != nil && c.idle() {
+		delete(p.circuits, id)
+	}
+}
+
+func (c *circuit) idle() bool {
+	return c != nil && c.fails == 0 && c.openUntil.IsZero() && !c.probing && len(c.pending) == 0
+}
+
+func (c *circuit) saw(id string) bool {
+	if c == nil {
+		return false
+	}
+	for _, f := range c.pending {
+		if f.id == id {
+			return f.sawByte
+		}
+	}
+	return false
 }
 
 func (c *circuit) hardOpen(now time.Time) bool {
@@ -593,12 +663,14 @@ func (c *circuit) fail(now time.Time, cfg settings, probe bool, s snap) bool {
 	if probe || recovering || c.fails >= cfg.failureThreshold {
 		c.openUntil = now.Add(cfg.cooldown)
 	}
+	c.changedAt = now
 	return !wasOpen && c.hardOpen(now)
 }
 
 func (c *circuit) succeed() {
 	c.fails = 0
 	c.openUntil = time.Time{}
+	c.changedAt = time.Time{}
 	c.probing = false
 	c.last = snap{}
 }
@@ -728,7 +800,44 @@ func keyServes(key schemas.Key, model string) bool {
 	if key.Models.IsEmpty() || !key.Models.IsAllowed(model) || key.BlacklistedModels.IsBlocked(model) {
 		return false
 	}
+	// An empty secret with no OAuth config cannot be selected. Core's
+	// provider-specific credential checks stay in core; an empty pool there
+	// still replays the stored upstream error.
+	if strings.TrimSpace(key.Value.GetValue()) == "" && key.OAuthKeyConfig == nil {
+		return false
+	}
+	if key.VLLMKeyConfig != nil && key.VLLMKeyConfig.ModelName != "" {
+		served := model
+		if key.Aliases != nil {
+			served = key.Aliases.Resolve(model)
+		}
+		if key.VLLMKeyConfig.ModelName != served {
+			return false
+		}
+	}
 	return true
+}
+
+func (p *Plugin) replayIfKeysSkipped(adm admission, err *schemas.BifrostError) *schemas.BifrostError {
+	if !skippedEveryKey(err) {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	for id, c := range p.circuits {
+		if id.scope == scopeKey && id.provider == adm.provider && id.model == adm.model && c.hardOpen(now) && c.last.status != 0 {
+			return c.last.replay()
+		}
+	}
+	return nil
+}
+
+func skippedEveryKey(err *schemas.BifrostError) bool {
+	if err == nil || err.Error == nil {
+		return false
+	}
+	return strings.Contains(err.Error.Message, "circuit breaker skipped every key")
 }
 
 func trim(s string, n int) string {

@@ -6608,9 +6608,22 @@ func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.Bif
 		}
 	}
 	if preReq == nil {
+		// A later pre-hook rejected the request. Post-hooks of the plugins whose
+		// pre-hook ran still have to settle, including one that admitted an
+		// upstream attempt it now will not send.
 		bifrostErr := newBifrostErrorFromMsg("bifrost request after plugin hooks cannot be nil")
 		bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
-		return nil, bifrostErr
+		resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		if bifrostErr != nil {
+			bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
+		} else if resp != nil {
+			resp.PopulateExtraFields(req.RequestType, provider, model, model)
+		}
+		drainAndAttachPluginLogs(ctx)
+		if bifrostErr != nil {
+			return nil, bifrostErr
+		}
+		return resp, nil
 	}
 
 	// "miscellaneous" phase: field re-read + channel-message setup before enqueue.
@@ -7002,9 +7015,21 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 		}
 	}
 	if preReq == nil {
+		// Same as tryRequest: a nil request after pre-hooks still runs post-hooks
+		// so an admission made by an earlier plugin is released.
 		bifrostErr := newBifrostErrorFromMsg("bifrost request after plugin hooks cannot be nil")
 		bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
-		return nil, bifrostErr
+		resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		if bifrostErr != nil {
+			bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
+		} else if resp != nil {
+			resp.PopulateExtraFields(req.RequestType, provider, model, model)
+		}
+		drainAndAttachPluginLogs(ctx)
+		if bifrostErr != nil {
+			return nil, bifrostErr
+		}
+		return newBifrostMessageChan(resp), nil
 	}
 
 	// "miscellaneous" phase: field re-read + channel-message setup before enqueue.

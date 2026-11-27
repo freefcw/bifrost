@@ -19,8 +19,8 @@
 | 失败 | 熔断范围 | 原因 |
 | --- | --- | --- |
 | 连接失败（`provider_connection_failed`，对端在第一个响应字节之前把连接关掉） | 整个 provider | 同一条上游链路，换 key 或换 model 也到不了 |
-| 超时、5xx | provider + model | 这个模型的端点没有在时限内给出可用响应；同一 provider 上的其他 model 不受影响 |
-| 429（仅当 `count_rate_limit: true`） | provider + model + key | 限流通常打在这一把 key 上，其他 key 继续用 |
+| 超时、5xx | 仅这个 provider 上的这个 model | 同一 provider 的其他 model 不受影响。5xx 正文里即使写了 rate limit，也算这个 model，不算 key |
+| HTTP 429（仅当 `count_rate_limit: true`） | provider + model + key | 只认状态码 429。其他 key 继续用 |
 | 4xx（参数、鉴权、配额、模型不存在等）、取消、无法归类的错误 | 不计数 | 不是上游宕机 |
 
 Key 选择发生在 `PreLLMHook` 之后。插件在 pre-hook 里把已经 open 的 key id 写进 `bifrost-circuit-skip-key-ids`，core 的 key 选择会跳过它们。调用方显式 pin 的 key 不会被静默换成另一把：那把 key 自己 open 时，这次尝试直接回放它的 429（或上次的错误），再走 fallback 链。若配置里每一把还能服务该 model 的 key 都 open，则整次尝试回放其中一把的真实错误，而不是再去打上游。
@@ -75,7 +75,7 @@ Key 选择发生在 `PreLLMHook` 之后。插件在 pre-hook 里把已经 open �
 
 插件未启用：不在插件链上。key 选择多一次 context 查找，找不到就返回，没有分配。
 
-插件启用且上游健康：pre-hook 拿一把互斥锁，查 map，在该 model 的在途列表上追加一条再放行。列表容量涨到并发高水位之后，稳态不再分配。没有 key 处于 open 时，不会去拉 key 列表。
+插件启用且上游健康：pre-hook 拿一把互斥锁，查 map，记一条在途再放行。请求正常结束后，如果这个 model 没有失败也没有别的在途请求，条目会删掉，所以不同的 model 名不会留在 map 里。没有 key 处于 open 时，不会去拉 key 列表。流式响应已经出过字节后再断连，只记在这个 model 上，不打开整个 provider。
 
 ---
 
@@ -98,8 +98,8 @@ A success clears that circuit's failure count. Cancellation is not a failure. An
 | Failure | Circuit | Why |
 | --- | --- | --- |
 | Connection failure (`provider_connection_failed`, peer closed before the first response byte) | whole provider | the same path is dead for every key and model |
-| Timeout, 5xx | provider + model | this model's endpoint did not answer in time; other models on the provider are left alone |
-| 429, only when `count_rate_limit` is true | provider + model + key | the limit is on that key; the others keep serving |
+| Timeout, 5xx | that model on that provider only | other models on the provider are left alone. A 5xx whose body mentions a rate limit is still this model, not a key |
+| HTTP 429, only when `count_rate_limit` is true | provider + model + key | status 429 only. The other keys keep serving |
 | 4xx (bad request, auth, quota, unknown model, …), cancellation, unrecognised errors | not counted | not an upstream outage |
 
 Key selection runs after `PreLLMHook`. The plugin puts open key ids on `bifrost-circuit-skip-key-ids`, and core skips those keys. A key the caller pinned is not silently replaced: if that key's circuit is open, the attempt replays its last error and the fallback chain runs. When every configured key that can serve the model is open, the attempt replays one of those real errors and does not call the upstream.
@@ -154,4 +154,4 @@ The plugin runs in the builtin group after governance, routing and the semantic 
 
 Plugin disabled: not in the plugin pipeline. Key selection does one extra context lookup, finds nothing, and allocates nothing.
 
-Plugin enabled, upstream healthy: the pre-hook takes one mutex, looks up the map, and appends one in-flight mark for that model. After the slice has grown to the concurrency high-water mark, the steady state does not allocate. The key list is not read unless some key circuit is open.
+Plugin enabled, upstream healthy: the pre-hook takes one mutex, looks the circuit up, and records one in-flight mark. When the attempt ends and that model has no failures and nothing else in flight, the entry is removed, so distinct model names do not accumulate. The key list is not read unless some key circuit is open. A stream that already produced a byte and then drops is counted for that model only, not for the whole provider.

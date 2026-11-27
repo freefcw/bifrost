@@ -179,8 +179,8 @@ func TestTimeoutOpensModelOnly(t *testing.T) {
 
 func TestRateLimitIsPerKey(t *testing.T) {
 	keys := []schemas.Key{
-		{ID: "key-a", Models: schemas.WhiteList{"*"}, Weight: 1},
-		{ID: "key-b", Models: schemas.WhiteList{"*"}, Weight: 1},
+		{ID: "key-a", Value: *schemas.NewSecretVar("sk-a"), Models: schemas.WhiteList{"*"}, Weight: 1},
+		{ID: "key-b", Value: *schemas.NewSecretVar("sk-b"), Models: schemas.WhiteList{"*"}, Weight: 1},
 	}
 	p := testPlugin(t, &Config{FailureThreshold: ptr(2), CooldownSeconds: ptr(30), CountRateLimit: ptr(true)}, func(schemas.ModelProvider) []schemas.Key {
 		return keys
@@ -366,6 +366,181 @@ func TestClassifyMatchesCore(t *testing.T) {
 	}
 	if bifrost.ClassifyFailure(statusErr(429, "rate limit exceeded", "rate_limit_error")) != schemas.FailureClassRateLimit {
 		t.Fatal("429 was not a rate limit")
+	}
+}
+
+func TestNamedPinReplaysOpenKey(t *testing.T) {
+	keys := []schemas.Key{
+		{ID: "key-a", Name: "primary", Value: *schemas.NewSecretVar("sk-a"), Models: schemas.WhiteList{"*"}, Weight: 1},
+		{ID: "key-b", Name: "other", Value: *schemas.NewSecretVar("sk-b"), Models: schemas.WhiteList{"*"}, Weight: 1},
+	}
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30), CountRateLimit: ptr(true)}, func(schemas.ModelProvider) []schemas.Key {
+		return keys
+	})
+	req := chat(schemas.OpenAI, "gpt-4o")
+	ctx := ctxWith("pin")
+	ctx.SetValue(schemas.BifrostContextKeyAttemptTrail, []schemas.KeyAttemptRecord{{
+		KeyID: "key-a", FailureClass: schemas.FailureClassRateLimit, StatusCode: ptr(429),
+	}})
+	if got := p.round(ctx, req, statusErr(429, "rate limit exceeded", "rate_limit_error")); got != nil {
+		t.Fatal(got)
+	}
+	named := ctxWith("named")
+	named.SetValue(schemas.BifrostContextKeyAPIKeyName, "primary")
+	got := p.round(named, req, nil)
+	if got == nil || got.StatusCode == nil || *got.StatusCode != 429 {
+		t.Fatalf("name pin = %v, want the open key's 429", got)
+	}
+}
+
+func TestSharedRequestIDDoesNotCrossFlights(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(100), SlowThresholdSeconds: ptr(1)}, nil)
+	start := time.Now()
+	p.now = func() time.Time { return start }
+	req := chat(schemas.OpenAI, "gpt-4o")
+	a, b := ctxWith("same"), ctxWith("same")
+	if _, sc, _ := p.PreLLMHook(a, req); sc != nil {
+		t.Fatal(sc)
+	}
+	if _, sc, _ := p.PreLLMHook(b, req); sc != nil {
+		t.Fatal(sc)
+	}
+	a.SetValue(schemas.BifrostContextKeyStreamStartTime, start)
+	_, _, _ = p.PostLLMHook(a, &schemas.BifrostResponse{}, nil)
+	mod := p.circuits[circuitID{scope: scopeModel, provider: schemas.OpenAI, model: "gpt-4o"}]
+	seen, unseen := 0, 0
+	for _, f := range mod.pending {
+		if f.sawByte {
+			seen++
+		} else {
+			unseen++
+		}
+	}
+	if seen != 1 || unseen != 1 {
+		t.Fatalf("pending = %+v, want one marked flight and one unmarked", mod.pending)
+	}
+}
+
+func TestNon429RateLimitStaysOnTheModel(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30), CountRateLimit: ptr(true)}, nil)
+	req := chat(schemas.OpenAI, "gpt-4o")
+	// 500 whose body says rate limit: ClassifyFailure calls it a rate limit, and
+	// the breaker still treats the 5xx as this model, not the key.
+	up := statusErr(500, "rate limit exceeded", "server_error")
+	if bifrost.ClassifyFailure(up) != schemas.FailureClassRateLimit {
+		t.Fatalf("class = %s, want the fixture to be a non-429 rate limit", bifrost.ClassifyFailure(up))
+	}
+	ctx := ctxWith("m")
+	ctx.SetValue(schemas.BifrostContextKeyAttemptTrail, []schemas.KeyAttemptRecord{{KeyID: "key-a", StatusCode: ptr(500)}})
+	if got := p.round(ctx, req, up); got != nil {
+		t.Fatal(got)
+	}
+	if _, ok := p.circuits[circuitID{scope: scopeKey, provider: schemas.OpenAI, model: "gpt-4o", keyID: "key-a"}]; ok {
+		t.Fatal("a 500 opened a key circuit")
+	}
+	if got := p.round(ctxWith("m2"), chat(schemas.OpenAI, "gpt-4o"), nil); got == nil || got.StatusCode == nil || *got.StatusCode != 500 {
+		t.Fatalf("model = %v, want the 500 replayed", got)
+	}
+	if got := p.round(ctxWith("m3"), chat(schemas.OpenAI, "other"), nil); got != nil {
+		t.Fatalf("other model blocked: %v", got.Error)
+	}
+}
+
+func TestStaleSuccessDoesNotEraseANewerOpen(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30)}, nil)
+	start := time.Now()
+	p.now = func() time.Time { return start }
+	req := chat(schemas.OpenAI, "gpt-4o")
+	older := ctxWith("older")
+	if _, sc, _ := p.PreLLMHook(older, req); sc != nil {
+		t.Fatal(sc)
+	}
+	start = start.Add(time.Second)
+	if p.round(ctxWith("newer"), req, statusErr(500, "internal error", "server_error")) != nil {
+		t.Fatal("newer failure should be admitted")
+	}
+	_, _, _ = p.PostLLMHook(older, nil, nil)
+	if got := p.round(ctxWith("after"), req, nil); got == nil {
+		t.Fatal("the older success closed the circuit the newer failure had opened")
+	}
+}
+
+func TestCancelKeepsTheTrailFailure(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30)}, nil)
+	req := chat(schemas.OpenAI, "gpt-4o")
+	ctx := ctxWith("c")
+	ctx.SetValue(schemas.BifrostContextKeyAttemptTrail, []schemas.KeyAttemptRecord{{
+		KeyID: "key-a", FailureClass: schemas.FailureClassTransient, StatusCode: ptr(500),
+		FailReason: ptr("server_error"),
+	}})
+	typ := schemas.RequestCancelled
+	cancel := &schemas.BifrostError{Type: &typ, Error: &schemas.ErrorField{Type: &typ, Message: "cancelled"}}
+	if got := p.round(ctx, req, cancel); got != nil {
+		t.Fatal(got)
+	}
+	if got := p.round(ctxWith("next"), req, nil); got == nil || got.StatusCode == nil || *got.StatusCode != 500 {
+		t.Fatalf("after cancel = %v, want the trail's 500 to have opened the model", got)
+	}
+}
+
+func TestMidStreamDropDoesNotOpenTheProvider(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30)}, nil)
+	req := chat(schemas.OpenAI, "gpt-4o")
+	ctx := ctxWith("s")
+	if _, sc, _ := p.PreLLMHook(ctx, req); sc != nil {
+		t.Fatal(sc)
+	}
+	ctx.SetValue(schemas.BifrostContextKeyStreamStartTime, time.Now())
+	_, _, _ = p.PostLLMHook(ctx, &schemas.BifrostResponse{}, nil)
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+	_, _, _ = p.PostLLMHook(ctx, nil, connectionErr())
+	if _, ok := p.circuits[circuitID{scope: scopeProvider, provider: schemas.OpenAI}]; ok {
+		t.Fatal("a drop after a stream byte opened the provider")
+	}
+	if got := p.round(ctxWith("other"), chat(schemas.OpenAI, "other-model"), nil); got != nil {
+		t.Fatalf("other model blocked: %v", got.Error)
+	}
+}
+
+func TestIdleModelCircuitIsRemoved(t *testing.T) {
+	p := testPlugin(t, nil, nil)
+	if got := p.round(ctxWith("ok"), chat(schemas.OpenAI, "gpt-4o"), nil); got != nil {
+		t.Fatal(got)
+	}
+	if _, ok := p.circuits[circuitID{scope: scopeModel, provider: schemas.OpenAI, model: "gpt-4o"}]; ok {
+		t.Fatal("a healthy model circuit was kept")
+	}
+}
+
+func TestSkippedKeyPoolReplaysTheStoredError(t *testing.T) {
+	p := testPlugin(t, &Config{FailureThreshold: ptr(1), CooldownSeconds: ptr(30), CountRateLimit: ptr(true)}, nil)
+	req := chat(schemas.OpenAI, "gpt-4o")
+	ctx := ctxWith("open")
+	ctx.SetValue(schemas.BifrostContextKeyAttemptTrail, []schemas.KeyAttemptRecord{{
+		KeyID: "key-a", FailureClass: schemas.FailureClassRateLimit, StatusCode: ptr(429),
+	}})
+	_ = p.round(ctx, req, statusErr(429, "rate limit exceeded", "rate_limit_error"))
+	next := ctxWith("skip")
+	if _, sc, _ := p.PreLLMHook(next, req); sc != nil {
+		t.Fatal("without a key list the open key is skipped, not short-circuited")
+	}
+	synth := &schemas.BifrostError{
+		Type:       ptr(schemas.NoKeySupportsModel),
+		StatusCode: ptr(400),
+		Error:      &schemas.ErrorField{Message: "circuit breaker skipped every key that supports model gpt-4o"},
+	}
+	_, out, _ := p.PostLLMHook(next, nil, synth)
+	if out == nil || out.StatusCode == nil || *out.StatusCode != 429 || out.Error.Message != "rate limit exceeded" {
+		t.Fatalf("skip-all = %v, want the stored 429", out)
+	}
+}
+
+func TestEmptyCredentialDoesNotCountAsServing(t *testing.T) {
+	if keyServes(schemas.Key{ID: "empty", Models: schemas.WhiteList{"*"}}, "gpt-4o") {
+		t.Fatal("an empty credential counted as able to serve the model")
+	}
+	if !keyServes(schemas.Key{ID: "ok", Value: *schemas.NewSecretVar("sk"), Models: schemas.WhiteList{"*"}}, "gpt-4o") {
+		t.Fatal("a key with a secret did not count")
 	}
 }
 
