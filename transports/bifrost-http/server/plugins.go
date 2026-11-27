@@ -17,6 +17,7 @@ import (
 	"github.com/maximhq/bifrost/plugins/routing"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
 	"github.com/maximhq/bifrost/plugins/telemetry"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/circuitbreaker"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 )
@@ -207,6 +208,21 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 	case modelcatalogresolver.PluginName:
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
 
+	case circuitbreaker.PluginName:
+		var cbConfig *circuitbreaker.Config
+		if pluginConfig != nil {
+			parsed, err := MarshalPluginConfig[circuitbreaker.Config](pluginConfig)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal circuit breaker config: %w", err)
+			}
+			cbConfig = parsed
+		}
+		var keys circuitbreaker.KeyLister
+		if bifrostConfig != nil && bifrostConfig.LiveStore != nil {
+			keys = bifrostConfig.GetProviderKeys
+		}
+		return circuitbreaker.Init(cbConfig, logger, keys)
+
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
 	}
@@ -257,6 +273,18 @@ func (s *BifrostHTTPServer) IsFixedBuiltinPlugin(name string) bool {
 // loadBuiltinPlugins loads required built-in plugins in specific order
 func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	builtinPlacement := schemas.Ptr(schemas.PluginPlacementBuiltin)
+
+	// Circuit breaker. Opt-in via plugins[] name "circuitbreaker". Runs after
+	// governance, routing and the semantic cache, so a cache hit never looks
+	// like an upstream success and an unauthenticated request is rejected
+	// before a skipped attempt replays an upstream error. Absent or disabled
+	// leaves the pipeline unchanged.
+	if cbCfg := s.getPluginConfig(circuitbreaker.PluginName); cbCfg != nil && cbCfg.Enabled {
+		s.registerPluginWithStatus(ctx, circuitbreaker.PluginName, nil, cbCfg.Config, false)
+	} else {
+		s.markPluginDisabled(circuitbreaker.PluginName)
+	}
+	s.Config.SetPluginOrderInfo(circuitbreaker.PluginName, builtinPlacement, schemas.Ptr(10))
 
 	// 1. Telemetry (always first - tracks everything).
 	// Default-on: absent PluginConfig entry is treated as enabled, matching pre-#3269 behavior

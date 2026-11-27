@@ -1801,6 +1801,61 @@ func TestSelectKeyFromProviderForModel_BlacklistedModels(t *testing.T) {
 	})
 }
 
+func TestSelectKeyFromProviderForModel_CircuitSkipKeys(t *testing.T) {
+	account := NewMockAccount()
+	account.AddProvider(schemas.OpenAI, 1, 1)
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+		{ID: "key-a", Name: "A", Value: *schemas.NewSecretVar("sk-a"), Models: schemas.WhiteList{"*"}, Weight: 1},
+		{ID: "key-b", Name: "B", Value: *schemas.NewSecretVar("sk-b"), Models: schemas.WhiteList{"*"}, Weight: 1},
+	})
+	client := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}
+
+	t.Run("absent set keeps the pool", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		pool, canRotate, err := client.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.OpenAI, "gpt-4o", schemas.OpenAI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !canRotate || len(pool) != 2 {
+			t.Fatalf("pool=%d canRotate=%v, want both keys", len(pool), canRotate)
+		}
+	})
+
+	t.Run("drops the listed key", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyCircuitSkipKeyIDs, map[string]struct{}{"key-a": {}})
+		pool, canRotate, err := client.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.OpenAI, "gpt-4o", schemas.OpenAI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if canRotate || len(pool) != 1 || pool[0].ID != "key-b" {
+			t.Fatalf("pool=%v canRotate=%v, want only key-b", pool, canRotate)
+		}
+	})
+
+	t.Run("pin wins over the skip list", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyAPIKeyID, "key-a")
+		ctx.SetValue(schemas.BifrostContextKeyCircuitSkipKeyIDs, map[string]struct{}{"key-a": {}})
+		pool, _, err := client.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.OpenAI, "gpt-4o", schemas.OpenAI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pool) != 1 || pool[0].ID != "key-a" {
+			t.Fatalf("pool=%v, want the pinned key", pool)
+		}
+	})
+
+	t.Run("every key listed fails selection", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyCircuitSkipKeyIDs, map[string]struct{}{"key-a": {}, "key-b": {}})
+		_, _, err := client.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.OpenAI, "gpt-4o", schemas.OpenAI)
+		if err == nil || !strings.Contains(err.Error(), "circuit breaker skipped every key") {
+			t.Fatalf("err=%v, want every key skipped", err)
+		}
+	})
+}
+
 func TestSelectKeyFromProviderForModel_VLLMAliasResolution(t *testing.T) {
 	account := NewMockAccount()
 	bifrost := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}

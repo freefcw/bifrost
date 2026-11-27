@@ -167,6 +167,7 @@ lockedmap	transports/bifrost-http/handlers	WebSocketHandler.clients	handle: open
 lockedmap	transports/bifrost-http/handlers	codexRelay.live	inflight: one Codex relay session, removed when it ends
 lockedmap	transports/bifrost-http/handlers	codexRelay.middlewareValues	inflight: one Codex relay session, removed when it ends
 lockedmap	transports/bifrost-http/handlers	codexRelay.turnHeaders	inflight: one Codex relay session, removed when it ends
+lockedmap	transports/bifrost-http/circuitbreaker	Plugin.circuits	decided: per-upstream health is read-modify-written under one mutex on every admitted attempt; a live-store table Get+Put would drop a concurrent failure count. One entry per provider, model or key that is in flight or unhealthy, removed when that provider or key recovers
 lockedmap	transports/bifrost-http/handlers	codexRelay.upstreamHeaders	inflight: one Codex relay session, removed when it ends
 lockedmap	transports/bifrost-http/handlers	filterDataCache.builds	inflight: single-flight builds, dropped when nobody holds them
 lockedmap	transports/bifrost-http/handlers	liveMeter.backends	handle: live metering lanes per open session

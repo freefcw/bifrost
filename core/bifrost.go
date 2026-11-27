@@ -6608,9 +6608,22 @@ func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.Bif
 		}
 	}
 	if preReq == nil {
+		// A later pre-hook rejected the request. Post-hooks of the plugins whose
+		// pre-hook ran still have to settle, including one that admitted an
+		// upstream attempt it now will not send.
 		bifrostErr := newBifrostErrorFromMsg("bifrost request after plugin hooks cannot be nil")
 		bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
-		return nil, bifrostErr
+		resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		if bifrostErr != nil {
+			bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
+		} else if resp != nil {
+			resp.PopulateExtraFields(req.RequestType, provider, model, model)
+		}
+		drainAndAttachPluginLogs(ctx)
+		if bifrostErr != nil {
+			return nil, bifrostErr
+		}
+		return resp, nil
 	}
 
 	// "miscellaneous" phase: field re-read + channel-message setup before enqueue.
@@ -7002,9 +7015,21 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 		}
 	}
 	if preReq == nil {
+		// Same as tryRequest: a nil request after pre-hooks still runs post-hooks
+		// so an admission made by an earlier plugin is released.
 		bifrostErr := newBifrostErrorFromMsg("bifrost request after plugin hooks cannot be nil")
 		bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
-		return nil, bifrostErr
+		resp, bifrostErr := pipeline.RunPostLLMHooks(ctx, nil, bifrostErr, preCount)
+		if bifrostErr != nil {
+			bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
+		} else if resp != nil {
+			resp.PopulateExtraFields(req.RequestType, provider, model, model)
+		}
+		drainAndAttachPluginLogs(ctx)
+		if bifrostErr != nil {
+			return nil, bifrostErr
+		}
+		return newBifrostMessageChan(resp), nil
 	}
 
 	// "miscellaneous" phase: field re-read + channel-message setup before enqueue.
@@ -11682,6 +11707,23 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 					}
 				}
 				return nil, false, fmt.Errorf("no supported key found with name %q for provider: %v and model: %s", keyName, providerKey, model)
+			}
+		}
+		// The circuit breaker lists keys to pass over. A pin above already returned, so a
+		// caller-selected key is kept. An empty remainder does not fall back to a listed
+		// key: that key was rejected and calling it would wait on the upstream.
+		if raw := ctx.Value(schemas.BifrostContextKeyCircuitSkipKeyIDs); raw != nil {
+			if skip, ok := raw.(map[string]struct{}); ok && len(skip) > 0 {
+				filtered := make([]schemas.Key, 0, len(supportedKeys))
+				for _, key := range supportedKeys {
+					if _, skipKey := skip[key.ID]; !skipKey {
+						filtered = append(filtered, key)
+					}
+				}
+				if len(filtered) == 0 {
+					return nil, false, fmt.Errorf("circuit breaker skipped every key that supports model %s", model)
+				}
+				supportedKeys = filtered
 			}
 		}
 	}

@@ -389,6 +389,7 @@ func TestClearCtxForFallback(t *testing.T) {
 		schemas.BifrostContextKeyAPIKeyID,
 		schemas.BifrostContextKeyAPIKeyName,
 		schemas.BifrostContextKeyGovernanceIncludeOnlyKeys,
+		schemas.BifrostContextKeyCircuitSkipKeyIDs,
 		schemas.BifrostContextKeyChangeRequestType,
 		schemas.BifrostContextKeyAttemptTrail,
 		schemas.BifrostContextKeyStreamEndIndicator,
