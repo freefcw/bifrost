@@ -278,13 +278,20 @@ const (
 const (
 	BifrostContextKeySessionToken       BifrostContextKey = "bifrost-session-token" // string (session token for authentication - set by auth middleware)
 	BifrostContextKeyAcceptedCredential BifrostContextKey = "bifrost-accepted-credential"
-	BifrostContextKeyVirtualKey         BifrostContextKey = "x-bf-vk"               // string
-	BifrostContextKeyAPIKeyName         BifrostContextKey = "x-bf-api-key"          // string (explicit key name selection)
-	BifrostContextKeyAPIKeyID           BifrostContextKey = "x-bf-api-key-id"       // string (explicit key ID selection, takes priority over name)
-	BifrostContextKeyDirectKey          BifrostContextKey = "x-bf-direct-key"       // schemas.Key (raw key supplied via x-bf-direct-key: true header; bypasses registered key pool)
-	BifrostContextKeyRequestID          BifrostContextKey = "request-id"            // string
-	BifrostContextKeyFallbackRequestID  BifrostContextKey = "fallback-request-id"   // string
-	BifrostContextKeyBillingNonce       BifrostContextKey = "bifrost-billing-nonce" // string (internally minted per physical HTTP request; makes the billing-idempotency key unforgeable since request-id may be caller-supplied via x-request-id. Never read from headers, never echoed to the caller - DO NOT SET THIS MANUALLY)
+	BifrostContextKeyVirtualKey         BifrostContextKey = "x-bf-vk"         // string
+	BifrostContextKeyAPIKeyName         BifrostContextKey = "x-bf-api-key"    // string (explicit key name selection)
+	BifrostContextKeyAPIKeyID           BifrostContextKey = "x-bf-api-key-id" // string (explicit key ID selection, takes priority over name)
+	// BifrostContextKeyCircuitSkipKeyIDs is a map[string]struct{} of provider key IDs an
+	// opt-in circuit breaker wants this attempt to pass over. It is not reserved, so the
+	// plugin can set it from PreLLMHook while restricted writes are held. Absent or empty
+	// leaves key selection unchanged. An explicit key pin is applied first and is not
+	// removed. When the set covers every eligible key, selection fails and the attempt
+	// does not call the upstream.
+	BifrostContextKeyCircuitSkipKeyIDs BifrostContextKey = "bifrost-circuit-skip-key-ids"
+	BifrostContextKeyDirectKey         BifrostContextKey = "x-bf-direct-key"       // schemas.Key (raw key supplied via x-bf-direct-key: true header; bypasses registered key pool)
+	BifrostContextKeyRequestID         BifrostContextKey = "request-id"            // string
+	BifrostContextKeyFallbackRequestID BifrostContextKey = "fallback-request-id"   // string
+	BifrostContextKeyBillingNonce      BifrostContextKey = "bifrost-billing-nonce" // string (internally minted per physical HTTP request; makes the billing-idempotency key unforgeable since request-id may be caller-supplied via x-request-id. Never read from headers, never echoed to the caller - DO NOT SET THIS MANUALLY)
 
 	// NOTE: []string is used for both keys, and by default all clients/tools are included (when nil).
 	// If "*" is present, all clients/tools are included, and [] means no clients/tools are included.
